@@ -120,6 +120,19 @@ with col2:
 with col3:
     smooth_window = st.slider("Smoothing (moving average)", 1, 50, 1)
 
+compare_metrics = st.multiselect(
+    "Compare extra metrics on same chart (optional)",
+    options=[c for c in y_options if c not in {"day", "timestamp", y_col}],
+    default=[],
+    help="Example: pick bid/ask along with mid_price for the selected product.",
+)
+
+aggregate_same_x = st.checkbox(
+    "Aggregate same timestamp values (mean) for cleaner line",
+    value=True,
+    help="Removes line thickening when many rows share the same timestamp.",
+)
+
 normalize_series = st.checkbox(
     "Normalize Y for easier comparison (start at 100)",
     value=False,
@@ -167,14 +180,62 @@ if normalize_series:
     plot_df[normalized_col] = (plot_df[y_to_plot] / first_vals.replace(0, pd.NA)) * 100
     y_to_plot = normalized_col
 
-fig = px.line(
-    plot_df,
-    x=x_col,
-    y=y_to_plot,
-    color=color_col,
-    title=f"{y_col} trend",
-)
-fig.update_layout(legend_title_text="Series", margin=dict(l=20, r=20, t=50, b=20))
+metric_cols = [y_col] + compare_metrics
+if len(metric_cols) > 1:
+    melted_df = plot_df.melt(
+        id_vars=[c for c in [x_col, "__source__", group_by] if c != "None"],
+        value_vars=metric_cols,
+        var_name="metric",
+        value_name="value",
+    ).dropna(subset=["value"])
+
+    if aggregate_same_x:
+        agg_cols = [x_col, "metric"]
+        if color_col:
+            agg_cols.append(color_col)
+        melted_df = (
+            melted_df.groupby(agg_cols, dropna=False, as_index=False)["value"]
+            .mean()
+            .sort_values(by=[x_col])
+        )
+
+    if color_col:
+        melted_df["series"] = melted_df[color_col].astype(str) + " | " + melted_df["metric"].astype(str)
+        color_for_plot = "series"
+    else:
+        color_for_plot = "metric"
+
+    fig = px.line(
+        melted_df,
+        x=x_col,
+        y="value",
+        color=color_for_plot,
+        title=f"{', '.join(metric_cols)} trend",
+        render_mode="webgl",
+    )
+else:
+    single_df = plot_df.copy()
+    if aggregate_same_x:
+        agg_cols = [x_col]
+        if color_col:
+            agg_cols.append(color_col)
+        single_df = (
+            single_df.groupby(agg_cols, dropna=False, as_index=False)[y_to_plot]
+            .mean()
+            .sort_values(by=[x_col])
+        )
+
+    fig = px.line(
+        single_df,
+        x=x_col,
+        y=y_to_plot,
+        color=color_col,
+        title=f"{y_col} trend",
+        render_mode="webgl",
+    )
+
+fig.update_traces(line={"width": 1.3})
+fig.update_layout(legend_title_text="Series", margin=dict(l=20, r=20, t=50, b=20), hovermode="x unified")
 st.plotly_chart(fig, use_container_width=True)
 
 st.subheader("Quick Summary")
