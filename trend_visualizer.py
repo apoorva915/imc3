@@ -1,4 +1,5 @@
 import io
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -43,6 +44,13 @@ def candidate_x_columns(df: pd.DataFrame) -> list[str]:
 
 def numeric_columns(df: pd.DataFrame) -> list[str]:
     return [c for c in df.select_dtypes(include=["number"]).columns if c != "row_index"]
+
+
+def parse_vev_strike(symbol: str) -> float | None:
+    match = re.match(r"^VEV_(\d+)$", str(symbol))
+    if not match:
+        return None
+    return float(match.group(1))
 
 
 workspace = Path.cwd()
@@ -261,3 +269,141 @@ with st.expander("Distribution view (simple box plot)"):
 
 with st.expander("Preview active data"):
     st.dataframe(plot_df.head(300), use_container_width=True)
+
+
+st.divider()
+st.header("Round 4 Insights")
+
+trades_sources = [name for name, df in loaded_frames.items() if {"buyer", "seller", "symbol", "price", "quantity"}.issubset(df.columns)]
+prices_sources = [name for name, df in loaded_frames.items() if {"product", "mid_price", "timestamp"}.issubset(df.columns)]
+
+tab_counterparty, tab_vev = st.tabs(["Counterparty (Mark IDs)", "VEV Analysis"])
+
+with tab_counterparty:
+    if not trades_sources:
+        st.info("Load at least one trades CSV to see counterparty analysis.")
+    else:
+        trades_all = pd.concat([loaded_frames[s].copy() for s in trades_sources], ignore_index=True)
+        trades_all["price"] = pd.to_numeric(trades_all["price"], errors="coerce")
+        trades_all["quantity"] = pd.to_numeric(trades_all["quantity"], errors="coerce")
+        trades_all = trades_all.dropna(subset=["price", "quantity"])
+        trades_all["notional"] = trades_all["price"] * trades_all["quantity"]
+        trades_all["symbol"] = trades_all["symbol"].astype(str)
+
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            cp_product = st.selectbox(
+                "Product / Symbol",
+                options=["All"] + sorted(trades_all["symbol"].unique().tolist()),
+                key="cp_product",
+            )
+        with col_b:
+            cp_side = st.selectbox("Side", options=["Both", "Buyer only", "Seller only"], key="cp_side")
+        with col_c:
+            top_n = st.slider("Show top N counterparties", 5, 30, 12, key="cp_top_n")
+
+        cp_df = trades_all.copy()
+        if cp_product != "All":
+            cp_df = cp_df[cp_df["symbol"] == cp_product]
+
+        if cp_side == "Buyer only":
+            cp_summary = (
+                cp_df.groupby("buyer", dropna=False)
+                .agg(trades=("quantity", "size"), quantity=("quantity", "sum"), notional=("notional", "sum"))
+                .reset_index()
+                .rename(columns={"buyer": "counterparty"})
+                .sort_values("notional", ascending=False)
+                .head(top_n)
+            )
+        elif cp_side == "Seller only":
+            cp_summary = (
+                cp_df.groupby("seller", dropna=False)
+                .agg(trades=("quantity", "size"), quantity=("quantity", "sum"), notional=("notional", "sum"))
+                .reset_index()
+                .rename(columns={"seller": "counterparty"})
+                .sort_values("notional", ascending=False)
+                .head(top_n)
+            )
+        else:
+            buy_side = (
+                cp_df.groupby("buyer", dropna=False)["quantity"]
+                .sum()
+                .reset_index()
+                .rename(columns={"buyer": "counterparty", "quantity": "buy_qty"})
+            )
+            sell_side = (
+                cp_df.groupby("seller", dropna=False)["quantity"]
+                .sum()
+                .reset_index()
+                .rename(columns={"seller": "counterparty", "quantity": "sell_qty"})
+            )
+            cp_summary = buy_side.merge(sell_side, on="counterparty", how="outer").fillna(0)
+            cp_summary["net_qty"] = cp_summary["buy_qty"] - cp_summary["sell_qty"]
+            cp_summary["abs_net"] = cp_summary["net_qty"].abs()
+            cp_summary = cp_summary.sort_values("abs_net", ascending=False).head(top_n)
+
+        if cp_summary.empty:
+            st.info("No matching rows for this filter.")
+        else:
+            if cp_side == "Both":
+                fig_cp = px.bar(cp_summary, x="counterparty", y="net_qty", title="Net traded quantity by counterparty")
+                fig_cp.update_layout(xaxis_title="", yaxis_title="Net quantity (buy - sell)")
+                st.plotly_chart(fig_cp, use_container_width=True)
+            else:
+                fig_cp = px.bar(cp_summary, x="counterparty", y="notional", title="Counterparty notional activity")
+                fig_cp.update_layout(xaxis_title="", yaxis_title="Notional")
+                st.plotly_chart(fig_cp, use_container_width=True)
+            st.dataframe(cp_summary, use_container_width=True)
+
+with tab_vev:
+    if not prices_sources:
+        st.info("Load at least one prices CSV for VEV analysis.")
+    else:
+        prices_all = pd.concat([loaded_frames[s].copy() for s in prices_sources], ignore_index=True)
+        prices_all["product"] = prices_all["product"].astype(str)
+        vev_prices = prices_all[prices_all["product"].str.startswith("VEV_")].copy()
+
+        if vev_prices.empty:
+            st.info("No VEV products found in selected prices files.")
+        else:
+            vev_prices["strike"] = vev_prices["product"].apply(parse_vev_strike)
+            underlying = prices_all[prices_all["product"] == "VELVETFRUIT_EXTRACT"][["day", "timestamp", "mid_price"]].rename(
+                columns={"mid_price": "underlying_mid"}
+            )
+            vev_joined = vev_prices.merge(underlying, on=["day", "timestamp"], how="left")
+            vev_joined["intrinsic"] = (vev_joined["underlying_mid"] - vev_joined["strike"]).clip(lower=0)
+            vev_joined["premium_over_intrinsic"] = vev_joined["mid_price"] - vev_joined["intrinsic"]
+
+            vev_symbols = sorted(vev_joined["product"].unique().tolist())
+            selected_vevs = st.multiselect(
+                "VEVs to compare",
+                options=vev_symbols,
+                default=vev_symbols[: min(4, len(vev_symbols))],
+                key="vev_symbols",
+            )
+            vev_metric = st.selectbox(
+                "VEV metric",
+                options=["mid_price", "intrinsic", "premium_over_intrinsic"],
+                index=2,
+                key="vev_metric",
+            )
+
+            vev_plot = vev_joined[vev_joined["product"].isin(selected_vevs)].sort_values(["day", "timestamp"])
+            if vev_plot.empty:
+                st.info("Select at least one VEV.")
+            else:
+                fig_vev = px.line(
+                    vev_plot,
+                    x="timestamp",
+                    y=vev_metric,
+                    color="product",
+                    facet_row="day",
+                    title=f"VEV {vev_metric} by day",
+                    render_mode="webgl",
+                )
+                fig_vev.update_traces(line={"width": 1.2})
+                fig_vev.update_layout(margin=dict(l=20, r=20, t=50, b=20))
+                st.plotly_chart(fig_vev, use_container_width=True)
+
+                tte_note = "TTE starts at 7 on day 1 and drops by 1 each day."
+                st.caption(tte_note)
